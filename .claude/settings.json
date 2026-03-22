@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go run:*)",
+      "Bash(curl -s http://localhost:8001/api/models)",
+      "Bash(curl -s http://localhost:8001/api/skills)"
+    ],
+    "additionalDirectories": [
+      "/Users/leven/space/test/nanobot-go/docs/design",
+      "/Users/leven/space/test/nanobot-go/deer-flow/backend/packages/harness/deerflow/agents/middlewares"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+pre_cmd = ["rm -rf tmp"]
+cmd = "go build -o ./tmp/nanobot ./cmd/nanobot/"
+include_ext = ["go"]
+exclude_dir = ["tmp", "vendor","bin","web"]
+
+
+# 这是现在唯一可靠的运行方式
+full_bin = "./tmp/nanobot gateway --api --api-port=8080"
+
+[log]
+time = true
+
+
+[screen]
+clear_on_rebuild = true
+keep_scroll = true

@@ -1,0 +1,239 @@
+# nanobot-go
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=for-the-badge&logo=go" alt="Go Version">
+  <img src="https://img.shields.io/badge/CloudWeGo-Eino-blue?style=for-the-badge" alt="Eino Framework">
+  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
+</p>
+
+## 项目简介
+
+nanobot-go 是一个基于 [CloudWeGo Eino](https://github.com/cloudwego/eino) 框架构建的轻量级 AI 个人助理。基于 [nanobot](https://github.com/hkuds/nanobot) 的 Go 语言重写版本，采用现代化的 Agent 架构设计，支持多种消息渠道和丰富的工具能力。
+
+### 核心特性
+
+- 🤖 **多 Agent 架构**：基于 Supervisor 模式的智能路由，支持 ReAct、Plan、Chat 等多种子 Agent
+- 📱 **多渠道支持**：支持 Matrix、钉钉、飞书、WebSocket、CLI 等多种消息渠道
+- 🔌 **丰富的工具**：内置文件操作、Web 搜索、代码执行、技能系统等工具
+- ⏰ **定时任务**：支持 Cron 表达式定时执行任务
+- 💓 **心跳服务**：定时检查任务文件并执行
+- 💾 **任务持久化**：任务状态自动持久化到文件系统
+
+## 技术架构
+
+### 技术栈
+
+| 类别 | 技术 |
+|------|------|
+| 编程语言 | Go 1.26+ |
+| Agent 框架 | CloudWeGo Eino |
+| 配置格式 | JSON / YAML |
+| 日志 | Uber Zap |
+| 命令行 | Cobra |
+
+### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        用户消息 (多渠道)                          │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│   │  Matrix  │  │ DingTalk │  │  WebSocket│  │   CLI   │  ...  │
+│   └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+└────────┼────────────┼────────────┼────────────┼────────────────┘
+         │            │            │            │
+         └────────────┴──────┬─────┴────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      消息总线 (MessageBus)                       │
+│                    统一的消息分发与订阅机制                        │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Supervisor Agent (入口)                       │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   意图识别与智能路由                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│  ReAct Agent  │    │  Plan Agent   │    │  Chat Agent   │
+│               │    │               │    │               │
+│ - 工具调用     │    │ - 任务规划     │    │ - 闲聊对话    │
+│ - 推理链      │    │ - 分步执行     │    │ - 简单问答    │
+│ - 长对话      │    │ - 动态重规划   │    │ - 信息查询    │
+└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        工具系统 (Tools)                           │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐    │
+│  │ 文件读写  │ │Web搜索  │ │ 代码执行 │ │ 定时任务 │ │ 技能系统 │ ...│
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 核心模块
+
+#### 1. Agent 模块 (`agent/`)
+- **Supervisor**：入口型 Agent，负责意图识别和路由
+- **ReAct Agent**：工具调用型 Agent，支持复杂的推理和工具使用
+- **Plan Agent**：规划型 Agent，支持任务分解和分步执行
+- **Chat Agent**：对话型 Agent，支持简单闲聊和问答
+- **Task Manager**：任务管理器，支持后台任务执行和状态跟踪
+
+#### 2. 渠道模块 (`channels/`)
+- **Matrix**：Matrix 协议即时通讯
+- **DingTalk**：钉钉自定义机器人
+- **WebSocket**：WebSocket 实时通信
+- **CLI**：命令行交互
+- **Feishu**：飞书渠道支持
+
+#### 3. 工具模块 (`agent/tools/`)
+| 工具 | 功能 |
+|------|------|
+| readfile | 读取文件内容 |
+| writefile | 写入文件内容 |
+| editfile | 编辑文件内容 |
+| listdir | 列出目录内容 |
+| exec | 执行系统命令 |
+| websearch | 网络搜索 |
+| webfetch | 网页内容抓取 |
+| cron | 定时任务管理 |
+| skill | 技能系统 |
+| task | 后台任务管理 |
+| message | 消息发送 |
+| askuser | 用户交互 |
+
+#### 4. 其他模块
+- **bus**：消息总线，解耦各组件
+- **config**：配置管理
+- **cron**：定时任务服务
+- **heartbeat**：心跳服务
+- **session**：会话管理
+
+## 快速开始
+
+### 安装
+
+```bash
+# 克隆项目
+git clone https://github.com/weibaohui/nanobot-go.git
+cd nanobot-go
+
+# 安装依赖
+go mod tidy
+
+# 初始化配置
+go run . onboard
+```
+
+### 开发模式
+
+```bash
+# 需要先安装 air
+go install github.com/cosmtrek/air@latest
+
+# 启动开发服务器
+make dev
+# 或者直接运行
+air
+```
+
+### 构建
+
+```bash
+# 交叉编译到所有平台
+make build
+
+# 清理构建产物
+make clean
+```
+
+### 运行
+
+```bash
+# 启动网关服务
+./nanobot gateway
+
+# 或指定配置文件
+./nanobot gateway --config /path/to/config.yaml
+```
+
+## 配置说明
+
+### 配置文件位置
+
+- 默认配置：`~/.nanobot/config.yaml`
+- 工作区：`~/.nanobot/workspace/`
+
+### 配置示例
+
+```yaml
+# ~/.nanobot/config.yaml
+agents:
+  defaults:
+    workspace: ~/.nanobot/workspace
+    model: anthropic/claude-opus-4-5
+    maxTokens: 8192
+    temperature: 0.7
+    maxToolIterations: 20
+
+channels:
+  matrix:
+    enabled: true
+    homeserver: https://matrix.org
+    userID: "@your-bot:matrix.org"
+    token: "your-access-token"
+
+  dingtalk:
+    enabled: false
+    clientID: "your-client-id"
+    clientSecret: "your-client-secret"
+
+providers:
+  siliconflow:
+    apiKey: "your-siliconflow-key"
+    baseURL: "https://api.siliconflow.cn/v1"
+
+  openai:
+    apiKey: "your-openai-key"
+
+heartbeat:
+  every: "30m"          # 心跳间隔
+  activeHours:          # 活跃时段（可选）
+    start: "09:00"
+    end: "18:00"
+    timezone: "Asia/Shanghai"
+  target: "!room:matrix.org"  # 消息发送目标
+  model: ""            # 心跳专用模型
+  prompt: ""           # 自定义提示词
+
+tools:
+  exec:
+    timeout: 60        # 命令执行超时时间（秒）
+  web:
+    search:
+      maxResults: 5    # 搜索结果最大数量
+```
+ 
+## 相关文档
+
+- [Supervisor 设计文档](agent/supervisor_design.md)
+- [任务管理需求文档](agent/task_manager_requirements.md)
+
+## 许可证
+
+MIT License
+
+## 致谢
+
+- [nanobot](https://github.com/weibaohui/nanobot) - 灵感来源
+- [CloudWeGo Eino](https://github.com/cloudwego/eino) - Agent 框架
+- [mautrix](https://github.com/mautrix/go) - Matrix SDK
