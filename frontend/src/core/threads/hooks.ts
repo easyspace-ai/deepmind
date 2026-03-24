@@ -362,7 +362,8 @@ export function useThreadStream({
           {
             threadId: threadId,
             streamSubgraphs: true,
-            streamResumable: true,
+            // 后端当前尚未实现 joinStream，先关闭恢复式流，避免前后端能力错配。
+            streamResumable: false,
             config: {
               recursion_limit: 1000,
             },

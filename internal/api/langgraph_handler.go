@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -671,6 +672,8 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 		userMessageText = "你好"
 	}
 
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+
 	// 创建 DeerFlow SSE Writer
 	sseWriter := deerflow.NewWriter(runID, c.Writer)
 	if sseWriter == nil {
@@ -678,6 +681,33 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 		return
 	}
 	defer sseWriter.Close()
+
+	c.Status(http.StatusOK)
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	writeStreamEnd := func(reason string, err error) {
+		endPayload := map[string]interface{}{
+			"run_id":    runID,
+			"thread_id": threadID,
+			"reason":    reason,
+		}
+		if err != nil {
+			endPayload["error"] = err.Error()
+		}
+		if writeErr := sseWriter.WriteEnd(endPayload); writeErr != nil {
+			h.logger.Debug("发送 end 事件失败", zap.Error(writeErr))
+		}
+	}
+
+	if err := sseWriter.WriteMetadata(map[string]interface{}{
+		"run_id":    runID,
+		"thread_id": threadID,
+	}); err != nil {
+		h.logger.Error("发送 metadata 事件失败", zap.Error(err))
+		return
+	}
 
 	// 添加用户消息
 	userMessageID := "msg-" + uuid.NewString()
@@ -689,7 +719,11 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	messages = append(messages, userMessage)
 
 	// 1. 发送用户消息
-	sseWriter.WriteMessagesTuple(serializeMessageForTuple(userMessage))
+	if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(userMessage)); err != nil {
+		h.logger.Error("发送用户 messages-tuple 失败", zap.Error(err))
+		writeStreamEnd("write_error", err)
+		return
+	}
 
 	// 2. 调用真实 LLM 流式获取响应
 	aiMessageID := "msg-" + runID
@@ -718,9 +752,7 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 
 		if chatModel != nil && err == nil {
 			h.logger.Info("调用真实 LLM 流式...")
-			einoMessages := []*schema.Message{
-				schema.UserMessage(userMessageText),
-			}
+			einoMessages := []*schema.Message{schema.UserMessage(userMessageText)}
 
 			// 创建流式 context
 			streamCtx, streamCancel := context.WithCancel(context.Background())
@@ -753,6 +785,7 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 					select {
 					case <-c.Request.Context().Done():
 						h.logger.Debug("客户端断开连接")
+						writeStreamEnd("client_disconnected", c.Request.Context().Err())
 						return
 					default:
 					}
@@ -762,7 +795,7 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 
 					if recvErr != nil {
 						// 检查是否是流结束
-						if recvErr == io.EOF || strings.Contains(recvErr.Error(), "EOF") || strings.Contains(recvErr.Error(), "end of stream") {
+						if errors.Is(recvErr, io.EOF) || strings.Contains(recvErr.Error(), "EOF") || strings.Contains(recvErr.Error(), "end of stream") {
 							h.logger.Debug("流式响应读取完毕", zap.Int("totalChunks", chunkCount))
 							// 发送剩余的 buffer
 							if buffer != "" {
@@ -772,10 +805,17 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 									"id":      aiMessageID,
 									"content": aiResponse.String(),
 								}
-								sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg))
+								if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg)); err != nil {
+									h.logger.Error("发送最终增量消息失败", zap.Error(err))
+									writeStreamEnd("write_error", err)
+									return
+								}
 							}
 						} else {
 							h.logger.Error("流式响应读取错误", zap.Error(recvErr), zap.Int("chunkCount", chunkCount))
+							if aiResponse.Len() == 0 {
+								aiResponse.WriteString(fmt.Sprintf("抱歉，流式读取失败：%v", recvErr))
+							}
 						}
 						break
 					}
@@ -812,7 +852,11 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 							"id":      aiMessageID,
 							"content": aiResponse.String(),
 						}
-						sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg))
+						if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg)); err != nil {
+							h.logger.Error("发送增量消息失败", zap.Error(err))
+							writeStreamEnd("write_error", err)
+							return
+						}
 
 						buffer = ""
 					}
@@ -834,7 +878,11 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 			"id":      aiMessageID,
 			"content": aiResponse.String(),
 		}
-		sseWriter.WriteMessagesTuple(serializeMessageForTuple(fullMsg))
+		if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(fullMsg)); err != nil {
+			h.logger.Error("发送回退消息失败", zap.Error(err))
+			writeStreamEnd("write_error", err)
+			return
+		}
 	}
 
 	// 3. 更新线程状态
@@ -868,14 +916,14 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	// 4. 发送 values 事件
 	thread, _ = h.threadStore.Get(threadID)
 	valuesEvent := buildValuesEvent(thread)
-	sseWriter.WriteValues(valuesEvent)
+	if err := sseWriter.WriteValues(valuesEvent); err != nil {
+		h.logger.Error("发送 values 事件失败", zap.Error(err))
+		writeStreamEnd("write_error", err)
+		return
+	}
 
 	// 5. 发送 end 事件
-	sseWriter.WriteEnd(map[string]interface{}{
-		"input_tokens":  0,
-		"output_tokens": 0,
-		"total_tokens":  0,
-	})
+	writeStreamEnd("completed", nil)
 }
 
 // joinStream 加入流式运行

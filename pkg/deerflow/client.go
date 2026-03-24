@@ -545,11 +545,20 @@ func parseEvent(eventType string, data []byte) (Event, error) {
 				}
 			}
 		}
+	case "messages-tuple":
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err == nil {
+			if content, ok := msg["content"].(string); ok {
+				return &MessageEvent{Content: content}, nil
+			}
+		}
 	case "finish":
 		var finish FinishEvent
 		if err := json.Unmarshal(data, &finish); err == nil {
 			return &finish, nil
 		}
+	case "end":
+		return &FinishEvent{Status: "completed"}, nil
 	case "events":
 		var eventMap map[string]interface{}
 		if err := json.Unmarshal(data, &eventMap); err == nil {
