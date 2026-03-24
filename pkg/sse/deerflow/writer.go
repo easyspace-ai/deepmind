@@ -24,10 +24,15 @@ func NewWriter(id string, w http.ResponseWriter) *Writer {
 	return &Writer{base: base}
 }
 
+// WriteMetadata 发送 metadata 事件
+func (w *Writer) WriteMetadata(metadata map[string]interface{}) error {
+	return w.base.WriteEventJSON("", "metadata", metadata)
+}
+
 // WriteMessagesTuple 发送 messages-tuple 事件
 // 用于发送 AI 消息的增量更新
 func (w *Writer) WriteMessagesTuple(msg interface{}) error {
-	return w.base.WriteEventJSON("", "messages-tuple", []interface{}{msg})
+	return w.base.WriteEventJSON("", "messages-tuple", msg)
 }
 
 // WriteValues 发送 values 事件
@@ -37,11 +42,8 @@ func (w *Writer) WriteValues(values map[string]interface{}) error {
 }
 
 // WriteEnd 发送 end 事件
-// 用于标记流结束，包含 usage 信息
-func (w *Writer) WriteEnd(usage map[string]interface{}) error {
-	data := map[string]interface{}{
-		"usage": usage,
-	}
+// 用于标记流结束
+func (w *Writer) WriteEnd(data map[string]interface{}) error {
 	return w.base.WriteEventJSON("", "end", data)
 }
 
@@ -53,9 +55,4 @@ func (w *Writer) Close() {
 // IsClosed 检查是否已关闭
 func (w *Writer) IsClosed() bool {
 	return w.base.IsClosed()
-}
-
-// SetDone 设置完成回调
-func (w *Writer) SetDone(f func(http.ResponseWriter) error) {
-	w.base.SetDone(f)
 }
