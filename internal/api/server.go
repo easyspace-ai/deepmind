@@ -23,13 +23,13 @@ type WebSocketHandler interface {
 
 // Server API 服务器
 type Server struct {
-	handler         *Handler
-	server          *http.Server
-	logger          *zap.Logger
-	router          *gin.Engine
-	providers       *Providers
-	wsHandler       WebSocketHandler
-	taskWSHandler   *TaskWebSocketHandler
+	handler       *Handler
+	server        *http.Server
+	logger        *zap.Logger
+	router        *gin.Engine
+	providers     *Providers
+	wsHandler     WebSocketHandler
+	taskWSHandler *TaskWebSocketHandler
 }
 
 // NewServer 创建 API 服务器
@@ -103,10 +103,11 @@ func NewServer(addr string, providers *Providers, logger *zap.Logger) *Server {
 	})
 
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		Addr:        addr,
+		Handler:     router,
+		ReadTimeout: 15 * time.Second,
+		// SSE uses long-lived responses, so a fixed write timeout will sever healthy streams.
+		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
 	}
 
