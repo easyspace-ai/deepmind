@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"github.com/bytedance/sonic"
 	"github.com/cloudwego/eino/schema"
@@ -14,6 +15,7 @@ type Writer struct {
 	id      string
 	w       http.ResponseWriter
 	flusher http.Flusher
+	mu      sync.Mutex
 	closed  bool
 	Done    func(http.ResponseWriter) error
 }
@@ -43,14 +45,21 @@ func (w *Writer) SetDone(f func(http.ResponseWriter) error) {
 }
 
 func (w *Writer) Close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.closed = true
 }
 
 func (w *Writer) IsClosed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.closed
 }
 
 func (w *Writer) WriteEvent(event *Event) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if event == nil || w.closed {
 		return nil
 	}
@@ -117,8 +126,16 @@ func (w *Writer) WriteDataString(data string) error {
 }
 
 func (w *Writer) WriteComment(comment string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+
 	_, err := fmt.Fprintf(w.w, ": %s\n\n", comment)
 	if err != nil {
+		w.closed = true
 		return err
 	}
 

@@ -20,7 +20,7 @@ import (
 const (
 	apiBase  = "https://ark.cn-beijing.volces.com/api/coding/v3"
 	apiKey   = "82c9ade2-b73a-4c5f-8ec6-5c507e0b6036"
-	modelName = "doubao-seed-2-0-pro-260215"
+	modelName = "doubao-seed-2.0-code"
 )
 
 func main() {

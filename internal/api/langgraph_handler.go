@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -630,6 +631,7 @@ type StreamRunRequest struct {
 // streamRun 流式运行（核心对话接口）
 // 一比一复刻 DeerFlow 的 SSE 事件格式：values, messages-tuple, end
 // 使用 pkg/sse/deerflow.Writer 替代手动 sendEvent
+// 修复1: 规范化流结束路径、改进客户端断开检测、增加详细日志、调整超时
 func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	threadID := c.Param("threadId")
 
@@ -649,6 +651,19 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 
 	runID := uuid.NewString()
 	h.runStore.Create(runID, threadID)
+
+	// ✅ 【修复】增加起始时间戳和logTiming辅助函数，用于追踪性能
+	startTime := time.Now()
+	logTiming := func(stage string, details ...interface{}) {
+		elapsed := time.Since(startTime)
+		h.logger.Info("SSE流程追踪",
+			zap.String("run_id", runID),
+			zap.String("stage", stage),
+			zap.Duration("elapsed_ms", elapsed),
+			zap.Any("details", details))
+	}
+
+	logTiming("start")
 
 	h.logger.Info("Stream run started (DeerFlow format - using deerflow.Writer)",
 		zap.String("thread_id", threadID),
@@ -679,6 +694,49 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	}
 	defer sseWriter.Close()
 
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.WriteHeader(http.StatusOK)
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	logTiming("sseWriter_created")
+
+	// ✅ 【修复】移除 sync.Once，让 defer 可以重试发送 end 事件
+	// 如果正常流程中 WriteEnd 失败，defer 仍然会尝试发送
+	writeStreamEnd := func(reason string, err error) {
+		endPayload := map[string]interface{}{
+			"run_id":    runID,
+			"thread_id": threadID,
+			"reason":    reason,
+		}
+		if err != nil {
+			endPayload["error"] = err.Error()
+		}
+		if writeErr := sseWriter.WriteEnd(endPayload); writeErr != nil {
+			h.logger.Debug("发送 end 事件失败", zap.Error(writeErr), zap.String("reason", reason))
+		} else {
+			h.logger.Debug("成功发送 end 事件", zap.String("reason", reason))
+		}
+		logTiming("end_event_sent", reason)
+	}
+
+	// 确保一定发送end事件（防止函数提前返回或panic导致未发end）
+	// 现在允许重试，如果正常流程失败，defer会再次尝试
+	defer func() {
+		writeStreamEnd("function_exit", nil)
+	}()
+
+	if err := sseWriter.WriteMetadata(map[string]interface{}{
+		"run_id":    runID,
+		"thread_id": threadID,
+	}); err != nil {
+		h.logger.Error("发送 metadata 事件失败", zap.Error(err))
+		// ✅ 【修复】显式调用writeStreamEnd而不是直接return
+		writeStreamEnd("metadata_error", err)
+		return
+	}
+	logTiming("metadata_sent")
+
 	// 添加用户消息
 	userMessageID := "msg-" + uuid.NewString()
 	userMessage := map[string]interface{}{
@@ -689,7 +747,50 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	messages = append(messages, userMessage)
 
 	// 1. 发送用户消息
-	sseWriter.WriteMessagesTuple(serializeMessageForTuple(userMessage))
+	if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(userMessage)); err != nil {
+		h.logger.Error("发送用户 messages-tuple 失败", zap.Error(err))
+		writeStreamEnd("user_message_error", err)
+		return
+	}
+	logTiming("user_message_sent")
+
+	// 模型调用期间可能长时间没有业务事件，这里定时发送注释保活，避免前端把连接判定为网络错误。
+	keepAliveTicker := time.NewTicker(5 * time.Second)
+	defer keepAliveTicker.Stop()
+
+	stopKeepAlive := make(chan struct{})
+	var stopKeepAliveOnce sync.Once
+	stopKeepAliveFn := func() {
+		stopKeepAliveOnce.Do(func() {
+			close(stopKeepAlive)
+		})
+	}
+	defer stopKeepAliveFn()
+
+	// keep-alive goroutine - 在没有业务事件时定时发送注释保活
+	keepAliveCount := 0
+	go func() {
+		for {
+			select {
+			case <-keepAliveTicker.C:
+				keepAliveCount++
+				if err := sseWriter.WriteKeepAlive(); err != nil {
+					h.logger.Debug("keep-alive发送失败",
+						zap.Int("count", keepAliveCount),
+						zap.Error(err))
+					return
+				}
+				// 按需打印keep-alive日志（可选，降低噪音）
+				// logTiming("keep_alive_sent", keepAliveCount)
+			case <-stopKeepAlive:
+				return
+			case <-c.Request.Context().Done():
+				return
+			}
+		}
+	}()
+
+	logTiming("keep_alive_started")
 
 	// 2. 调用真实 LLM 流式获取响应
 	aiMessageID := "msg-" + runID
@@ -717,30 +818,26 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 			zap.Error(err))
 
 		if chatModel != nil && err == nil {
+			logTiming("llm_call_start")
 			h.logger.Info("调用真实 LLM 流式...")
-			einoMessages := []*schema.Message{
-				schema.UserMessage(userMessageText),
-			}
+			einoMessages := []*schema.Message{schema.UserMessage(userMessageText)}
 
-			// 创建流式 context
-			streamCtx, streamCancel := context.WithCancel(context.Background())
+			// ✅ 【修复】改进超时机制：总流120s，给keep-alive充足的空间
+			streamCtx, streamCancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
 			defer streamCancel()
-
-			// 监听客户端断开
-			go func() {
-				<-c.Request.Context().Done()
-				h.logger.Debug("客户端断开连接，取消流式调用")
-				streamCancel()
-			}()
 
 			// 调用 Stream 方法
 			streamReader, streamErr := chatModel.Stream(streamCtx, einoMessages)
 			if streamErr != nil {
 				h.logger.Error("LLM 流式调用失败", zap.Error(streamErr))
+				// ✅ 【修复】显式调用writeStreamEnd而不是默默进入fallback
+				writeStreamEnd("llm_error", streamErr)
 				aiResponse.WriteString(fmt.Sprintf("抱歉，LLM 流式调用失败：%v", streamErr))
+				logTiming("llm_error", streamErr.Error())
 			} else {
 				defer streamReader.Close()
 
+				logTiming("llm_stream_created")
 				h.logger.Info("开始读取流式响应...")
 
 				// 参考 test/Agent-Eino 的实现：使用 buffer 累积 delta
@@ -749,83 +846,144 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 				chunkCount := 0
 
 				for {
-					// 检查客户端是否断开
+					// ✅ 【修复】改进客户端断开检测：定期检查context，不让recv()长期阻塞
 					select {
 					case <-c.Request.Context().Done():
-						h.logger.Debug("客户端断开连接")
+						h.logger.Debug("客户端断开连接",
+							zap.Int("chunks_read", chunkCount))
+						writeStreamEnd("client_disconnected", c.Request.Context().Err())
+						stopKeepAliveFn()
+						logTiming("client_disconnected", chunkCount)
 						return
 					default:
 					}
 
-					chunk, recvErr := streamReader.Recv()
-					chunkCount++
+					// 使用 goroutine + channel 避免 recv() 长期阻塞
+					// 设置 recvDone 超时为 8s（超过keep-alive间隔5s，给点余量）
+					recvDone := make(chan interface{}, 1)
+					go func() {
+						chunk, recvErr := streamReader.Recv()
+						recvDone <- map[string]interface{}{
+							"chunk": chunk,
+							"err":   recvErr,
+						}
+					}()
 
-					if recvErr != nil {
-						// 检查是否是流结束
-						if recvErr == io.EOF || strings.Contains(recvErr.Error(), "EOF") || strings.Contains(recvErr.Error(), "end of stream") {
-							h.logger.Debug("流式响应读取完毕", zap.Int("totalChunks", chunkCount))
-							// 发送剩余的 buffer
-							if buffer != "" {
+					select {
+					case <-c.Request.Context().Done():
+						h.logger.Debug("客户端断开连接（在recv超时前）",
+							zap.Int("chunks_read", chunkCount))
+						writeStreamEnd("client_disconnected", c.Request.Context().Err())
+						stopKeepAliveFn()
+						logTiming("client_disconnected_before_recv", chunkCount)
+						return
+
+					case <-time.After(8 * time.Second):
+						// 8s还没有新chunk - 可能网络卡住或客户端已断开
+						// keep-alive会保活连接，继续等待
+						h.logger.Debug("等待chunk超时，继续等待（keep-alive保活中）",
+							zap.Int("chunks_read", chunkCount))
+						continue
+
+					case result := <-recvDone:
+						if result != nil {
+							res := result.(map[string]interface{})
+							chunk := res["chunk"].(*schema.Message)
+							
+							// ✅ 修复：先检查err是否为nil，再进行类型断言
+							var recvErr error
+							if res["err"] != nil {
+								recvErr = res["err"].(error)
+							}
+							
+							chunkCount++
+
+							if recvErr != nil {
+								// 检查是否是流结束
+								if errors.Is(recvErr, io.EOF) || strings.Contains(recvErr.Error(), "EOF") || strings.Contains(recvErr.Error(), "end of stream") {
+									h.logger.Debug("流式响应读取完毕", zap.Int("totalChunks", chunkCount))
+									logTiming("stream_recv_complete", chunkCount)
+									// 发送剩余的 buffer
+									if buffer != "" {
+										aiResponse.WriteString(buffer)
+										partialMsg := map[string]interface{}{
+											"type":    "ai",
+											"id":      aiMessageID,
+											"content": aiResponse.String(),
+										}
+										if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg)); err != nil {
+											h.logger.Error("发送最终增量消息失败", zap.Error(err))
+											writeStreamEnd("write_error", err)
+											return
+										}
+									}
+								} else {
+									h.logger.Error("流式响应读取错误", zap.Error(recvErr), zap.Int("chunkCount", chunkCount))
+									// ✅ 【修复】这里也要调用writeStreamEnd()
+									writeStreamEnd("stream_recv_error", recvErr)
+									logTiming("stream_recv_error", recvErr.Error())
+									if aiResponse.Len() == 0 {
+										aiResponse.WriteString(fmt.Sprintf("抱歉，流式读取失败：%v", recvErr))
+									}
+								}
+								break
+							}
+
+							if chunk == nil {
+								continue
+							}
+
+							h.logger.Debug("[StreamReader] received chunk",
+								zap.Int("chunkNum", chunkCount),
+								zap.String("role", string(chunk.Role)),
+								zap.Int("contentLen", len(chunk.Content)),
+								zap.Int("toolCallsCount", len(chunk.ToolCalls)))
+
+							// 处理工具调用（暂略）
+							if len(chunk.ToolCalls) > 0 {
+								continue
+							}
+
+							if chunk.Content == "" {
+								continue
+							}
+
+							// 关键：delta 追加，不是替换！
+							buffer += chunk.Content
+
+							// 更实时地发送：每 3 字符或遇到标点就发送
+							if len(buffer) >= flushThreshold || strings.Contains(buffer, "。") || strings.Contains(buffer, "\n") || strings.Contains(buffer, "！") || strings.Contains(buffer, "？") {
 								aiResponse.WriteString(buffer)
+
 								partialMsg := map[string]interface{}{
 									"type":    "ai",
 									"id":      aiMessageID,
 									"content": aiResponse.String(),
 								}
-								sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg))
+								if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg)); err != nil {
+									h.logger.Error("发送增量消息失败", zap.Error(err))
+									writeStreamEnd("write_error", err)
+									return
+								}
+
+								buffer = ""
 							}
-						} else {
-							h.logger.Error("流式响应读取错误", zap.Error(recvErr), zap.Int("chunkCount", chunkCount))
 						}
-						break
-					}
-
-					if chunk == nil {
-						continue
-					}
-
-					h.logger.Debug("[StreamReader] received chunk",
-						zap.Int("chunkNum", chunkCount),
-						zap.String("role", string(chunk.Role)),
-						zap.Int("contentLen", len(chunk.Content)),
-						zap.Int("toolCallsCount", len(chunk.ToolCalls)),
-						zap.String("content", chunk.Content))
-
-					// 处理工具调用（暂略）
-					if len(chunk.ToolCalls) > 0 {
-						continue
-					}
-
-					if chunk.Content == "" {
-						continue
-					}
-
-					// 关键：delta 追加，不是替换！
-					buffer += chunk.Content
-
-					// 更实时地发送：每 3 字符或遇到标点就发送
-					if len(buffer) >= flushThreshold || strings.Contains(buffer, "。") || strings.Contains(buffer, "\n") || strings.Contains(buffer, "！") || strings.Contains(buffer, "？") {
-						aiResponse.WriteString(buffer)
-
-						partialMsg := map[string]interface{}{
-							"type":    "ai",
-							"id":      aiMessageID,
-							"content": aiResponse.String(),
-						}
-						sseWriter.WriteMessagesTuple(serializeMessageForTuple(partialMsg))
-
-						buffer = ""
 					}
 				}
 
+				logTiming("llm_complete", chunkCount)
 				h.logger.Info("LLM 流式调用完成", zap.Int("len", aiResponse.Len()))
 			}
 		}
 	}
 
+	stopKeepAliveFn()
+
 	// 如果没有 AI 响应，使用模拟消息
 	if aiResponse.Len() == 0 {
 		h.logger.Warn("使用硬编码模拟消息")
+		logTiming("fallback_message")
 		aiResponse.WriteString(fmt.Sprintf("你好！我是 DeerFlow AI 助手。你说的是：%s", userMessageText))
 
 		// 发送完整消息
@@ -834,7 +992,11 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 			"id":      aiMessageID,
 			"content": aiResponse.String(),
 		}
-		sseWriter.WriteMessagesTuple(serializeMessageForTuple(fullMsg))
+		if err := sseWriter.WriteMessagesTuple(serializeMessageForTuple(fullMsg)); err != nil {
+			h.logger.Error("发送回退消息失败", zap.Error(err))
+			writeStreamEnd("write_error", err)
+			return
+		}
 	}
 
 	// 3. 更新线程状态
@@ -864,18 +1026,21 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	}
 
 	h.threadStore.Update(threadID, threadUpdates)
+	logTiming("thread_state_updated")
 
 	// 4. 发送 values 事件
 	thread, _ = h.threadStore.Get(threadID)
 	valuesEvent := buildValuesEvent(thread)
-	sseWriter.WriteValues(valuesEvent)
+	if err := sseWriter.WriteValues(valuesEvent); err != nil {
+		h.logger.Error("发送 values 事件失败", zap.Error(err))
+		writeStreamEnd("write_error", err)
+		return
+	}
+	logTiming("values_sent")
 
 	// 5. 发送 end 事件
-	sseWriter.WriteEnd(map[string]interface{}{
-		"input_tokens":  0,
-		"output_tokens": 0,
-		"total_tokens":  0,
-	})
+	writeStreamEnd("completed", nil)
+	logTiming("function_exit")
 }
 
 // joinStream 加入流式运行
