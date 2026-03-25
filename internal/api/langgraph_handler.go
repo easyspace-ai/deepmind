@@ -672,8 +672,6 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 		userMessageText = "你好"
 	}
 
-	c.Writer.Header().Set("X-Accel-Buffering", "no")
-
 	// 创建 DeerFlow SSE Writer
 	sseWriter := deerflow.NewWriter(runID, c.Writer)
 	if sseWriter == nil {
@@ -682,23 +680,27 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 	}
 	defer sseWriter.Close()
 
-	c.Status(http.StatusOK)
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.WriteHeader(http.StatusOK)
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
 
+	var endOnce sync.Once
 	writeStreamEnd := func(reason string, err error) {
-		endPayload := map[string]interface{}{
-			"run_id":    runID,
-			"thread_id": threadID,
-			"reason":    reason,
-		}
-		if err != nil {
-			endPayload["error"] = err.Error()
-		}
-		if writeErr := sseWriter.WriteEnd(endPayload); writeErr != nil {
-			h.logger.Debug("发送 end 事件失败", zap.Error(writeErr))
-		}
+		endOnce.Do(func() {
+			endPayload := map[string]interface{}{
+				"run_id":    runID,
+				"thread_id": threadID,
+				"reason":    reason,
+			}
+			if err != nil {
+				endPayload["error"] = err.Error()
+			}
+			if writeErr := sseWriter.WriteEnd(endPayload); writeErr != nil {
+				h.logger.Debug("发送 end 事件失败", zap.Error(writeErr))
+			}
+		})
 	}
 
 	if err := sseWriter.WriteMetadata(map[string]interface{}{
@@ -724,6 +726,35 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 		writeStreamEnd("write_error", err)
 		return
 	}
+
+	// 模型调用期间可能长时间没有业务事件，这里定时发送注释保活，避免前端把连接判定为网络错误。
+	keepAliveTicker := time.NewTicker(5 * time.Second)
+	defer keepAliveTicker.Stop()
+
+	stopKeepAlive := make(chan struct{})
+	var stopKeepAliveOnce sync.Once
+	stopKeepAliveFn := func() {
+		stopKeepAliveOnce.Do(func() {
+			close(stopKeepAlive)
+		})
+	}
+	defer stopKeepAliveFn()
+
+	go func() {
+		for {
+			select {
+			case <-keepAliveTicker.C:
+				if err := sseWriter.WriteKeepAlive(); err != nil {
+					h.logger.Debug("发送 keep-alive 失败", zap.Error(err))
+					return
+				}
+			case <-stopKeepAlive:
+				return
+			case <-c.Request.Context().Done():
+				return
+			}
+		}
+	}()
 
 	// 2. 调用真实 LLM 流式获取响应
 	aiMessageID := "msg-" + runID
@@ -754,16 +785,9 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 			h.logger.Info("调用真实 LLM 流式...")
 			einoMessages := []*schema.Message{schema.UserMessage(userMessageText)}
 
-			// 创建流式 context
-			streamCtx, streamCancel := context.WithCancel(context.Background())
+			// Create a request-scoped timeout so upstream hangs can still end the SSE cleanly.
+			streamCtx, streamCancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 			defer streamCancel()
-
-			// 监听客户端断开
-			go func() {
-				<-c.Request.Context().Done()
-				h.logger.Debug("客户端断开连接，取消流式调用")
-				streamCancel()
-			}()
 
 			// 调用 Stream 方法
 			streamReader, streamErr := chatModel.Stream(streamCtx, einoMessages)
@@ -786,6 +810,7 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 					case <-c.Request.Context().Done():
 						h.logger.Debug("客户端断开连接")
 						writeStreamEnd("client_disconnected", c.Request.Context().Err())
+						stopKeepAliveFn()
 						return
 					default:
 					}
@@ -866,6 +891,8 @@ func (h *LangGraphHandler) streamRun(c *gin.Context) {
 			}
 		}
 	}
+
+	stopKeepAliveFn()
 
 	// 如果没有 AI 响应，使用模拟消息
 	if aiResponse.Len() == 0 {

@@ -47,6 +47,11 @@ func (w *Writer) WriteEnd(data map[string]interface{}) error {
 	return w.base.WriteEventJSON("", "end", data)
 }
 
+// WriteKeepAlive 发送注释保活，避免长时间静默时连接被前端或代理断开。
+func (w *Writer) WriteKeepAlive() error {
+	return w.base.WriteKeepAlive()
+}
+
 // Close 关闭 Writer
 func (w *Writer) Close() {
 	w.base.Close()

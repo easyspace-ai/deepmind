@@ -126,8 +126,16 @@ func (w *Writer) WriteDataString(data string) error {
 }
 
 func (w *Writer) WriteComment(comment string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+
 	_, err := fmt.Fprintf(w.w, ": %s\n\n", comment)
 	if err != nil {
+		w.closed = true
 		return err
 	}
 
